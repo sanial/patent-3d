@@ -1,0 +1,79 @@
+App.tsx integration patch — notes
+==================================
+
+This file is *not* compiled; it documents the minimal edits needed in
+src/App.tsx to wire PatentUploadPanel into the existing layout.
+
+----------------------------------------------------------------------
+1. Imports
+----------------------------------------------------------------------
+
+    import { PatentUploadPanel } from './ocr/PatentUploadPanel';
+    import type { ParsePatentResponse } from './ocr/usePatentUpload';
+
+----------------------------------------------------------------------
+2. State for parsed patent data
+----------------------------------------------------------------------
+
+    const [patentData, setPatentData] = useState<Record<string, {
+      label: string; description: string; claims: number[]; pages: number[];
+    }> | null>(null);
+
+----------------------------------------------------------------------
+3. Handler
+----------------------------------------------------------------------
+
+    const handlePatentParsed = (resp: ParsePatentResponse) => {
+      setPatentData(resp.patentData);
+      // Optional: rebuild the Three.js scene from new data.
+      // scene.rebuildFromData(resp.patentData);
+    };
+
+----------------------------------------------------------------------
+4. Render — drop the panel into the existing sidebar grid
+----------------------------------------------------------------------
+
+    <PatentUploadPanel onResult={handlePatentParsed} />
+
+----------------------------------------------------------------------
+5. Hook extension — rebuildFromData (stub)
+----------------------------------------------------------------------
+
+Add to useThreeScene.ts to swap PATENT_DATA at runtime:
+
+    const rebuildFromData = useCallback(
+      (data: Record<string, { label: string; description: string; claims: number[] }>) => {
+        const scene = sceneRef.current;
+        if (!scene) return;
+
+        // Dispose old groups
+        Object.values(componentMeshesRef.current).forEach((g) => {
+          g.traverse((o) => {
+            if (o instanceof THREE.Mesh) {
+              o.geometry.dispose();
+              const m = o.material as THREE.Material | THREE.Material[];
+              Array.isArray(m) ? m.forEach((x) => x.dispose()) : m.dispose();
+            }
+          });
+          scene.remove(g);
+        });
+        componentMeshesRef.current = {};
+
+        // Re-run builders using new ref numbers. For now this is a placeholder
+        // — the existing builders are hard-coded. A future change can derive
+        // builder choice from data[ref].label keywords (sensor, controller, …).
+        Object.keys(data).forEach((ref, i) => {
+          buildSensorModule(scene, ref, -3 + i * 1.5, (i % 2 ? 35 : -35), i % 2 ? -1 : 1);
+        });
+      },
+      []
+    );
+
+Then expose rebuildFromData from the hook's return value.
+
+----------------------------------------------------------------------
+6. Environment
+----------------------------------------------------------------------
+
+    # .env.local at repo root
+    VITE_OCR_API_URL=http://localhost:8000

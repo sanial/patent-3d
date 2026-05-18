@@ -3,6 +3,8 @@ import { Header } from './components/Header';
 import { Viewport } from './components/Viewport';
 import { ClaimsPanel } from './components/ClaimsPanel';
 import { AnnotationLabels } from './components/AnnotationLabels';
+import { PatentUploadPanel } from './ocr/PatentUploadPanel';
+import type { ParsePatentResponse } from './ocr/usePatentUpload';
 import { useThreeScene } from './hooks/useThreeScene';
 import styles from './App.module.css';
 
@@ -53,6 +55,13 @@ export default function App() {
         annotationsActive={annotationsActive}
       />
       <Viewport ref={viewportRef} selectedRef={selectedRef} />
+      <aside className={styles.leftSidebar}>
+        <PatentUploadPanel
+          onResult={(resp: ParsePatentResponse) => {
+            console.log('Patent parsed:', resp);
+          }}
+        />
+      </aside>
       <ClaimsPanel
         selectedRef={selectedRef}
         visibilityMap={visibilityMap}
