@@ -10,8 +10,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import os
+from pathlib import Path
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ocr.patent_ocr_pipeline import PatentOCRPipeline
@@ -89,3 +94,30 @@ async def parse_patent(file: UploadFile = File(...)) -> dict[str, Any]:
         "result": result.to_dict(),
         "patentData": result.to_patent_data_format(),
     }
+
+
+# ── Static frontend (Cloud Run / production) ────────────────────────────────
+# When STATIC_DIR is set (e.g. inside the Docker image), serve the built
+# Vite SPA from FastAPI. API routes above take precedence.
+_static_dir = Path(os.environ.get("STATIC_DIR", "/app/static"))
+if _static_dir.is_dir():
+    _assets_dir = _static_dir / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
+
+    _index = _static_dir / "index.html"
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404)
+        candidate = (_static_dir / full_path).resolve()
+        try:
+            candidate.relative_to(_static_dir.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404)
+        if candidate.is_file():
+            return FileResponse(candidate)
+        if _index.is_file():
+            return FileResponse(_index)
+        raise HTTPException(status_code=404)
