@@ -122,9 +122,15 @@ class PatentOCRPipeline:
     def run(self, pdf_bytes: bytes) -> PatentOCRResult:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
-            blocks = self._pass1_pymupdf(doc)
+            # OCR scanned pages once and reuse across passes.
+            page_ocr: dict[int, list[tuple[str, tuple[float, float, float, float]]]] = {}
+            for i, page in enumerate(doc):
+                if not _page_has_native_text(page):
+                    page_ocr[i] = self._ocr_page_lines(page)
+
+            blocks = self._pass1_pymupdf(doc, page_ocr)
             figures = self._pass2_easyocr(doc)
-            extracted = extract_figures(doc)
+            extracted = extract_figures(doc, page_ocr)
             result = self._assemble(blocks, figures)
             result.extracted_figures = extracted
 
@@ -143,15 +149,22 @@ class PatentOCRPipeline:
 
     # -- pass 1 ------------------------------------------------------------
 
-    def _pass1_pymupdf(self, doc: "fitz.Document") -> list[TextBlock]:
+    def _pass1_pymupdf(
+        self,
+        doc: "fitz.Document",
+        page_ocr: dict[int, list[tuple[str, tuple[float, float, float, float]]]] | None = None,
+    ) -> list[TextBlock]:
+        page_ocr = page_ocr or {}
         blocks: list[TextBlock] = []
         for page_idx, page in enumerate(doc):
+            had_native = False
             data = page.get_text("dict")
             for block in data.get("blocks", []):
                 for line in block.get("lines", []):
                     text = " ".join(s.get("text", "") for s in line.get("spans", [])).strip()
                     if not text:
                         continue
+                    had_native = True
                     blocks.append(
                         TextBlock(
                             page=page_idx,
@@ -160,7 +173,48 @@ class PatentOCRPipeline:
                             source="pymupdf",
                         )
                     )
+            # Fallback for scanned pages: use whole-page OCR.
+            if not had_native and page_idx in page_ocr:
+                for text, bbox in page_ocr[page_idx]:
+                    blocks.append(
+                        TextBlock(page=page_idx, text=text, bbox=bbox, source="easyocr")
+                    )
         return blocks
+
+    # -- per-page OCR helper ---------------------------------------------
+
+    def _ocr_page_lines(
+        self, page: "fitz.Page"
+    ) -> list[tuple[str, tuple[float, float, float, float]]]:
+        """OCR an entire page and return ``(text, bbox-in-PDF-points)`` lines."""
+        reader = _get_reader(self.langs, self.gpu)
+        matrix = fitz.Matrix(self.image_scale, self.image_scale)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, 3
+        )
+        try:
+            ocr_out = reader.readtext(arr)
+        except Exception:
+            return []
+        sx = page.rect.width / pix.width
+        sy = page.rect.height / pix.height
+        lines: list[tuple[str, tuple[float, float, float, float]]] = []
+        for bbox_pts, text, conf in ocr_out:
+            if conf < self.min_confidence or not text.strip():
+                continue
+            xs = [p[0] for p in bbox_pts]
+            ys = [p[1] for p in bbox_pts]
+            bbox = (
+                float(min(xs)) * sx,
+                float(min(ys)) * sy,
+                float(max(xs)) * sx,
+                float(max(ys)) * sy,
+            )
+            lines.append((text.strip(), bbox))
+        # Sort roughly top-to-bottom, left-to-right (8 pt row tolerance).
+        lines.sort(key=lambda t: (round(t[1][1] / 8.0), t[1][0]))
+        return _merge_ocr_lines(lines)
 
     # -- pass 2 ------------------------------------------------------------
 
@@ -268,6 +322,46 @@ def _get_reader(langs: list[str], gpu: bool):
 
         _easyocr_reader = easyocr.Reader(langs, gpu=gpu, verbose=False)
     return _easyocr_reader
+
+
+def _page_has_native_text(page: "fitz.Page") -> bool:
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if span.get("text", "").strip():
+                    return True
+    return False
+
+
+def _merge_ocr_lines(
+    lines: list[tuple[str, tuple[float, float, float, float]]],
+) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Merge OCR fragments that sit on the same baseline into single lines.
+
+    EasyOCR returns word-level boxes; structure/claim parsing expects lines.
+    """
+    if not lines:
+        return []
+    out: list[tuple[str, tuple[float, float, float, float]]] = []
+    cur_text = lines[0][0]
+    cur_bbox = list(lines[0][1])
+    cur_row_y = (cur_bbox[1] + cur_bbox[3]) / 2
+    for text, bbox in lines[1:]:
+        row_y = (bbox[1] + bbox[3]) / 2
+        same_row = abs(row_y - cur_row_y) < 6.0
+        if same_row:
+            cur_text = f"{cur_text} {text}"
+            cur_bbox[0] = min(cur_bbox[0], bbox[0])
+            cur_bbox[1] = min(cur_bbox[1], bbox[1])
+            cur_bbox[2] = max(cur_bbox[2], bbox[2])
+            cur_bbox[3] = max(cur_bbox[3], bbox[3])
+        else:
+            out.append((cur_text, tuple(cur_bbox)))  # type: ignore[arg-type]
+            cur_text = text
+            cur_bbox = list(bbox)
+            cur_row_y = row_y
+    out.append((cur_text, tuple(cur_bbox)))  # type: ignore[arg-type]
+    return out
 
 
 def _extract_title(blocks: list[TextBlock]) -> str:

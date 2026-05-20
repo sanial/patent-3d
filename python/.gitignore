@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+figs_out/
+strip_*.png
+test_out.txt
+

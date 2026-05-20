@@ -7,6 +7,7 @@ Run from ``patent-ocr-layer/src``:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -20,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ocr.patent_ocr_pipeline import PatentOCRPipeline
+from ocr.figure_extractor import extract_figures_fast
 from llm.gemma_client import GemmaClient
 
 logger = logging.getLogger("patent-ocr")
@@ -84,7 +86,9 @@ async def parse_patent(file: UploadFile = File(...)) -> dict[str, Any]:
 
     logger.info("Parsing %s (%d bytes)", file.filename, len(pdf_bytes))
     try:
-        result = _pipeline.run(pdf_bytes)
+        # Run the blocking pipeline in a worker thread so other endpoints
+        # (e.g. /api/extract-figures) can be served concurrently.
+        result = await asyncio.to_thread(_pipeline.run, pdf_bytes)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Pipeline failed")
         raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}") from exc
@@ -93,6 +97,45 @@ async def parse_patent(file: UploadFile = File(...)) -> dict[str, Any]:
         "filename": file.filename,
         "result": result.to_dict(),
         "patentData": result.to_patent_data_format(),
+    }
+
+
+@app.post("/api/extract-figures")
+async def extract_figures_endpoint(
+    file: UploadFile = File(...),
+    ocr_captions: bool = True,
+    use_gemma: bool = False,
+) -> dict[str, Any]:
+    """Fast figure-only extraction. Returns figures in seconds, even on scanned PDFs."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf files are accepted")
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(pdf_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF exceeds 50 MB limit")
+    logger.info("Extracting figures from %s (%d bytes, gemma=%s)",
+                file.filename, len(pdf_bytes), use_gemma)
+    try:
+        # extract_figures_fast is sync and (with use_gemma=True) calls
+        # asyncio.run() internally — offload to a worker thread so it
+        # doesn't collide with the running event loop and doesn't block
+        # /api/parse-patent from being served in parallel.
+        figs = await asyncio.to_thread(
+            extract_figures_fast,
+            pdf_bytes,
+            None,    # langs
+            False,   # gpu
+            4,       # max_workers
+            ocr_captions,
+            use_gemma,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fast figure extraction failed")
+        raise HTTPException(status_code=500, detail=f"Extractor error: {exc}") from exc
+    return {
+        "filename": file.filename,
+        "extractedFigures": [f.to_dict() for f in figs],
     }
 
 
