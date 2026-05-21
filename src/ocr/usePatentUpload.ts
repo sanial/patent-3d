@@ -158,6 +158,63 @@ export function usePatentUpload({ apiUrl, onResult }: UsePatentUploadOptions = {
         });
       });
 
+      // Fire the fast claim extractor (Gemma 4 vision on the last few
+      // pages) in parallel too. Claims tab populates within seconds,
+      // bypassing the slow OCR path entirely.
+      const claimsPromise = (async () => {
+        try {
+          console.log('[patent] fast claim extractor: requesting');
+          const r = await fetch(
+            `${baseUrl}/api/extract-claims?last_pages=4`,
+            { method: 'POST', body: buildForm() }
+          );
+          if (!r.ok) {
+            const detail = await r.text();
+            console.warn('[patent] fast claim extractor failed', r.status, detail);
+            return null;
+          }
+          const j = (await r.json()) as { claims?: ParsedClaim[] };
+          console.log('[patent] fast claim extractor returned', j.claims?.length, 'claims');
+          return j.claims ?? null;
+        } catch (e) {
+          console.warn('[patent] fast claim extractor threw', e);
+          return null;
+        }
+      })();
+
+      void claimsPromise.then((claims) => {
+        if (!claims || claims.length === 0) return;
+        setResult((prev) => {
+          const claimBodies = claims.map((c) => c.body);
+          if (prev) {
+            const structure = prev.result.structure
+              ? { ...prev.result.structure, claims }
+              : { sections: {}, claims, refDefinitions: {} };
+            return {
+              ...prev,
+              result: {
+                ...prev.result,
+                claims: claimBodies,
+                structure,
+              },
+            };
+          }
+          return {
+            filename: file.name,
+            result: {
+              title: '',
+              abstract: '',
+              claims: claimBodies,
+              refEntries: {},
+              figures: [],
+              extractedFigures: [],
+              structure: { sections: {}, claims, refDefinitions: {} },
+            },
+            patentData: {},
+          };
+        });
+      });
+
       try {
         const resp = await fetch(`${baseUrl}/api/parse-patent`, {
           method: 'POST',
@@ -175,13 +232,30 @@ export function usePatentUpload({ apiUrl, onResult }: UsePatentUploadOptions = {
         // If the fast extractor already returned figures, prefer those —
         // they're more reliable than the inline ones from parse-patent.
         const fastFigs = await figuresPromise;
-        const merged: ParsePatentResponse =
+        const fastClaims = await claimsPromise;
+        let merged: ParsePatentResponse =
           fastFigs && fastFigs.length > 0
             ? {
                 ...json,
                 result: { ...json.result, extractedFigures: fastFigs },
               }
             : json;
+        // Prefer fast Gemma-vision claims when parse-patent came up empty.
+        const parsedClaimCount = merged.result.structure?.claims?.length ?? 0;
+        if (fastClaims && fastClaims.length > 0 && parsedClaimCount === 0) {
+          const claimBodies = fastClaims.map((c) => c.body);
+          const structure = merged.result.structure
+            ? { ...merged.result.structure, claims: fastClaims }
+            : { sections: {}, claims: fastClaims, refDefinitions: {} };
+          merged = {
+            ...merged,
+            result: {
+              ...merged.result,
+              claims: claimBodies,
+              structure,
+            },
+          };
+        }
         setResult(merged);
         setProgress(1);
         setStatus('done');

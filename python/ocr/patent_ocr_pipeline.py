@@ -62,6 +62,7 @@ class PatentOCRResult:
     figures: list[FigureHit] = field(default_factory=list)
     extracted_figures: list[ExtractedFigure] = field(default_factory=list)
     structure: StructuredPatent | None = None
+    full_text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +137,7 @@ class PatentOCRPipeline:
 
             # Structure parse from the assembled full text.
             full_text = "\n".join(b.text for b in blocks)
+            result.full_text = full_text
             result.structure = parse_structure(full_text)
 
             # Promote structure.refDefinitions into ref_entries labels.

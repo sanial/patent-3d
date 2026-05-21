@@ -53,6 +53,7 @@ DEFAULT_API_BASE = os.environ.get(
     "GEMMA_API_BASE", "https://generativelanguage.googleapis.com/v1beta"
 )
 DEFAULT_API_MODEL = os.environ.get("GEMMA_API_MODEL", "gemma-4-31b-it")
+DEFAULT_VISION_MODEL = os.environ.get("GEMMA_VISION_MODEL", "gemini-2.5-flash")
 
 DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_OLLAMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:4b")
@@ -127,6 +128,7 @@ class GemmaClient:
     api_key: str | None = API_KEY
     api_base: str = DEFAULT_API_BASE
     api_model: str = DEFAULT_API_MODEL
+    vision_model: str = DEFAULT_VISION_MODEL
     ollama_base_url: str = DEFAULT_OLLAMA_URL
     ollama_model: str = DEFAULT_OLLAMA_MODEL
     timeout: float = REQUEST_TIMEOUT
@@ -164,6 +166,257 @@ class GemmaClient:
 
         _cache_put(cache_key, result)
         return result
+
+    async def extract_claims_from_text(
+        self,
+        full_text: str,
+        max_chars: int = 60_000,
+    ) -> list[dict[str, Any]]:
+        """Use Gemma to extract numbered claims from messy OCR text.
+
+        Returns dicts shaped like ``ParsedClaim.to_dict()``:
+        ``{"number", "type", "body", "refs", "dependsOn"}``. Returns ``[]``
+        on failure rather than raising — the caller can fall back to whatever
+        the regex parser produced.
+        """
+        if not full_text or not full_text.strip():
+            return []
+
+        # Patents put claims at the end. Bias the window toward the tail so
+        # we don't waste tokens on the spec.
+        text = full_text[-max_chars:] if len(full_text) > max_chars else full_text
+
+        prompt = (
+            "You are given the OCR text of a US patent. The text may contain "
+            "OCR errors. Find the CLAIMS section (it usually starts with "
+            "'What is claimed is:', 'We claim:', or 'Claims:') and extract "
+            "every numbered claim.\n\n"
+            "For each claim produce:\n"
+            "  number      — the claim number (1, 2, 3, ...)\n"
+            "  type        — 'independent' or 'dependent'\n"
+            "  body        — the full claim text, with OCR errors cleaned up\n"
+            "  refs        — list of reference numerals mentioned (strings like '101')\n"
+            "  dependsOn   — claim number it depends on, or null\n\n"
+            "Return EXACTLY one JSON object, no prose, no markdown fences:\n"
+            '{"claims":[{"number":1,"type":"independent","body":"...",'
+            '"refs":["101","102"],"dependsOn":null}, ...]}\n\n'
+            "If no claims section is found, return {\"claims\":[]}.\n\n"
+            "--- PATENT TEXT ---\n"
+            f"{text}"
+        )
+
+        try:
+            if self.api_key:
+                # Prefer the fast Gemini vision model for this step too — it
+                # supports responseMimeType=json which deterministically
+                # suppresses the chain-of-thought that open Gemma emits.
+                model_for_extract = (
+                    self.vision_model
+                    if self.vision_model.startswith("gemini")
+                    else self.api_model
+                )
+                url = (
+                    f"{self.api_base.rstrip('/')}/models/{model_for_extract}:generateContent"
+                    f"?key={self.api_key}"
+                )
+                gen_cfg: dict[str, Any] = {
+                    "temperature": 0.0,
+                    "maxOutputTokens": 8192,
+                }
+                if model_for_extract.startswith("gemini"):
+                    gen_cfg["responseMimeType"] = "application/json"
+                payload = {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": gen_cfg,
+                }
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code >= 400:
+                        logger.error(
+                            "Gemma extract_claims error %s: %s",
+                            resp.status_code,
+                            resp.text,
+                        )
+                    resp.raise_for_status()
+                    body = resp.json()
+                content = body["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                url = f"{self.ollama_base_url}/v1/chat/completions"
+                payload = {
+                    "model": self.ollama_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.0,
+                }
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    body = resp.json()
+                content = body["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemma claim extraction failed: %s", exc)
+            return []
+
+        try:
+            json_text = _extract_json(content)
+            obj = json.loads(json_text)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Gemma claim extraction returned non-JSON: %s", exc)
+            return []
+
+        raw = obj.get("claims") if isinstance(obj, dict) else None
+        if not isinstance(raw, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for c in raw:
+            if not isinstance(c, dict):
+                continue
+            try:
+                number = int(c.get("number"))
+            except (TypeError, ValueError):
+                continue
+            body_text = str(c.get("body") or "").strip()
+            if not body_text:
+                continue
+            depends_on_raw = c.get("dependsOn")
+            try:
+                depends_on = int(depends_on_raw) if depends_on_raw is not None else None
+            except (TypeError, ValueError):
+                depends_on = None
+            ctype = str(c.get("type") or ("dependent" if depends_on else "independent"))
+            refs_raw = c.get("refs") or []
+            refs = sorted({str(r) for r in refs_raw if r is not None})
+            out.append(
+                {
+                    "number": number,
+                    "type": ctype,
+                    "body": body_text,
+                    "refs": refs,
+                    "dependsOn": depends_on,
+                }
+            )
+        out.sort(key=lambda d: d["number"])
+        return out
+
+    async def extract_claims_from_pages(
+        self,
+        page_pngs_b64: list[str],
+    ) -> list[dict[str, Any]]:
+        """Extract claims from page images via a two-step pipeline.
+
+        Step 1: transcribe each page in parallel (Gemma 4 vision, one call
+                per page, small outputs — reliable JSON).
+        Step 2: feed the concatenated transcript to ``extract_claims_from_text``.
+
+        Avoids the failure mode where a single all-pages call blows the
+        output-token budget on chain-of-thought before emitting JSON.
+        """
+        if not page_pngs_b64:
+            return []
+
+        transcripts = await self._transcribe_pages(page_pngs_b64, max_concurrency=2)
+        for i, t in enumerate(transcripts):
+            logger.info("Gemma transcribe page %d: %d chars", i, len(t))
+        full_text = "\n\n".join(t for t in transcripts if t)
+        # Dump for offline inspection.
+        try:
+            (CACHE_DIR / "last_transcript.txt").write_text(full_text, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        if not full_text.strip():
+            logger.warning(
+                "Gemma claim-from-pages: transcripts empty for %d pages",
+                len(page_pngs_b64),
+            )
+            return []
+        logger.info(
+            "Gemma claim-from-pages: transcribed %d pages → %d chars",
+            len(page_pngs_b64), len(full_text),
+        )
+        return await self.extract_claims_from_text(full_text)
+
+    async def _transcribe_pages(
+        self,
+        page_pngs_b64: list[str],
+        max_concurrency: int = 2,
+    ) -> list[str]:
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def one(b64: str) -> str:
+            async with sem:
+                return await self._transcribe_one_page(b64)
+
+        return await asyncio.gather(*[one(b) for b in page_pngs_b64])
+
+    async def _transcribe_one_page(self, png_b64: str) -> str:
+        prompt = (
+            "Transcribe ALL readable text on this US patent page, in reading "
+            "order, preserving line breaks and claim numbering. Include every "
+            "word — headings, claims, footnotes — but NO commentary, NO "
+            "analysis, NO markdown, NO code fences.\n\n"
+            "Output format: emit the line `<<<BEGIN>>>` on its own line, then "
+            "the verbatim transcribed text, then the line `<<<END>>>` on its "
+            "own line. Nothing else."
+        )
+        timeout = max(self.timeout, 240.0)
+        parts: list[dict[str, Any]] = [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": png_b64}},
+        ]
+
+        try:
+            if self.api_key:
+                url = (
+                    f"{self.api_base.rstrip('/')}/models/{self.vision_model}:generateContent"
+                    f"?key={self.api_key}"
+                )
+                payload: dict[str, Any] = {
+                    "contents": [{"role": "user", "parts": parts}],
+                    "generationConfig": {"temperature": 0.0, "maxOutputTokens": 8192},
+                }
+                # Gemini models (not open Gemma) accept responseMimeType.
+                if self.vision_model.startswith("gemini"):
+                    payload["generationConfig"]["responseMimeType"] = "text/plain"
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    body = resp.json()
+                content = body["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                url = f"{self.ollama_base_url}/v1/chat/completions"
+                payload = {
+                    "model": self.ollama_model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{png_b64}"}},
+                        ],
+                    }],
+                    "temperature": 0.0,
+                }
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    body = resp.json()
+                content = body["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Gemma transcribe page failed: %s: %r",
+                type(exc).__name__, exc,
+            )
+            return ""
+        text = str(content or "")
+        # Strip the model's reasoning preamble using the delimiters.
+        begin = text.find("<<<BEGIN>>>")
+        if begin != -1:
+            text = text[begin + len("<<<BEGIN>>>"):]
+            end = text.rfind("<<<END>>>")
+            if end != -1:
+                text = text[:end]
+        return text.strip()
 
     async def classify_figure_pages(
         self,

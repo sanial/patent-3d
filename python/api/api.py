@@ -93,6 +93,39 @@ async def parse_patent(file: UploadFile = File(...)) -> dict[str, Any]:
         logger.exception("Pipeline failed")
         raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}") from exc
 
+    # If the regex-based claim parser came up empty (common on scanned
+    # patents whose section headers are mangled by OCR), let Gemma 4 pull
+    # the claims out of the assembled OCR text.
+    structure = result.structure
+    regex_claims = structure.claims if structure else []
+    if structure is not None and not regex_claims and result.full_text:
+        logger.info(
+            "No claims from regex parser — falling back to Gemma extraction "
+            "(%d chars of OCR text)",
+            len(result.full_text),
+        )
+        try:
+            gemma_claims = await _gemma.extract_claims_from_text(result.full_text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemma claim extraction raised: %s", exc)
+            gemma_claims = []
+        if gemma_claims:
+            from ocr.structure import ParsedClaim  # local import avoids cycle
+
+            structure.claims = [
+                ParsedClaim(
+                    number=c["number"],
+                    type=c["type"],
+                    body=c["body"],
+                    refs=c["refs"],
+                    dependsOn=c["dependsOn"],
+                )
+                for c in gemma_claims
+            ]
+            # Mirror onto the flat list used by patentData claim attribution.
+            result.claims = [c["body"] for c in gemma_claims]
+            logger.info("Gemma extracted %d claims", len(gemma_claims))
+
     return {
         "filename": file.filename,
         "result": result.to_dict(),
@@ -136,6 +169,69 @@ async def extract_figures_endpoint(
     return {
         "filename": file.filename,
         "extractedFigures": [f.to_dict() for f in figs],
+    }
+
+
+def _render_last_pages_b64(pdf_bytes: bytes, n: int, scale: float = 1.5) -> list[str]:
+    """Render the last ``n`` pages of a PDF to base64-encoded PNGs."""
+    import base64
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        total = doc.page_count
+        start = max(0, total - n)
+        matrix = fitz.Matrix(scale, scale)
+        out: list[str] = []
+        for idx in range(start, total):
+            pix = doc[idx].get_pixmap(matrix=matrix, alpha=False)
+            out.append(base64.b64encode(pix.tobytes("png")).decode("ascii"))
+        return out
+    finally:
+        doc.close()
+
+
+@app.post("/api/extract-claims")
+async def extract_claims_endpoint(
+    file: UploadFile = File(...),
+    last_pages: int = 4,
+) -> dict[str, Any]:
+    """Fast claim-only extraction using Gemma 4 vision on the last N pages.
+
+    Skips OCR entirely — sends the rasterised claim pages directly to Gemma.
+    Designed to be called in parallel with /api/parse-patent so the Claims
+    tab populates quickly even on scanned PDFs.
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only .pdf files are accepted")
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(pdf_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF exceeds 50 MB limit")
+
+    logger.info(
+        "Extracting claims from %s (%d bytes, last %d pages)",
+        file.filename, len(pdf_bytes), last_pages,
+    )
+    try:
+        page_pngs = await asyncio.to_thread(
+            _render_last_pages_b64, pdf_bytes, last_pages, 1.5
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Page render failed")
+        raise HTTPException(status_code=500, detail=f"Render error: {exc}") from exc
+
+    try:
+        claims = await _gemma.extract_claims_from_pages(page_pngs)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Gemma claim extraction failed")
+        raise HTTPException(status_code=502, detail=f"Gemma error: {exc}") from exc
+
+    logger.info("Gemma extracted %d claims from %d pages", len(claims), len(page_pngs))
+    return {
+        "filename": file.filename,
+        "claims": claims,
     }
 
 
